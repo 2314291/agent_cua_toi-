@@ -1,0 +1,338 @@
+"""Test tool của Research Agent.
+
+Các test gọi mạng thật được đánh dấu @pytest.mark.network. Khi mạng trường chập
+chờn thì chạy: pytest -m "not network"
+"""
+
+from __future__ import annotations
+
+import datetime
+
+import pytest
+
+from app.core.contracts import ERROR_PREFIX
+from app.agents.research_agent.tools import (
+    SearchBudget,
+    default_research_tools,
+    make_arxiv_tool,
+    make_openalex_tool,
+    make_wikipedia_tool,
+    reset_search_budget,
+    tim_arxiv,
+)
+
+
+def test_arxiv_truy_van_rong_tra_error_chuan():
+    out = make_arxiv_tool().invoke({"text": "   "})
+    assert out.startswith(ERROR_PREFIX) and "EMPTY_QUERY" in out
+
+
+def test_openalex_truy_van_rong_tra_error_chuan():
+    out = make_openalex_tool().invoke({"text": "   "})
+    assert out.startswith(ERROR_PREFIX) and "EMPTY_QUERY" in out
+
+
+def test_wikipedia_truy_van_rong_tra_error_chuan():
+    out = make_wikipedia_tool().invoke({"text": ""})
+    assert out.startswith(ERROR_PREFIX) and "EMPTY_QUERY" in out
+
+
+def _bo_qua_neu_mat_mang(out: str) -> str:
+    """Mạng trường/proxy chặn thì SKIP, không FAIL — tránh test đỏ giả."""
+    if out.startswith(ERROR_PREFIX) and "UNAVAILABLE" in out:
+        pytest.skip(f"Không gọi được mạng ngoài: {out[:120]}")
+    return out
+
+
+@pytest.mark.network
+def test_arxiv_tra_ve_bai_bao_that():
+    out = _bo_qua_neu_mat_mang(
+        make_arxiv_tool(top_k=1, max_chars=600).invoke({"text": "rotary positional embedding"})
+    )
+    assert "Title:" in out and "Published:" in out
+
+
+@pytest.mark.network
+def test_openalex_tra_ve_bai_bao_that():
+    out = _bo_qua_neu_mat_mang(
+        make_openalex_tool(top_k=1, max_chars=600).invoke({"text": "rotary positional embedding"})
+    )
+    assert "Title:" in out and "OpenAlex ID:" in out
+
+
+@pytest.mark.network
+def test_wikipedia_tra_ve_trang_that():
+    out = _bo_qua_neu_mat_mang(
+        make_wikipedia_tool(top_k=1, max_chars=800).invoke({"text": "machine learning"})
+    )
+    assert "Page:" in out and "Summary:" in out
+
+
+@pytest.mark.network
+def test_wikipedia_khong_dinh_loi_user_agent():
+    """Wikimedia chặn User-Agent mặc định của requests -> body rỗng -> JSONDecodeError.
+
+    Nếu quên set_user_agent, tool sẽ trả WIKIPEDIA_UNAVAILABLE kèm đúng thông báo
+    'Expecting value: line 1 column 1 (char 0)'.
+    """
+    out = _bo_qua_neu_mat_mang(make_wikipedia_tool(top_k=1).invoke({"text": "transformer deep learning"}))
+    assert "Expecting value: line 1 column 1" not in out
+
+
+# --------------------------------------------------------------------------- #
+# Dây phanh chống vòng lặp ReAct — chạy được offline, không tốn hạn mức
+# --------------------------------------------------------------------------- #
+from app.agents.research_agent.tools import SearchBudget
+
+
+def test_budget_tu_choi_truy_van_lap_lai():
+    b = SearchBudget(max_calls=10)
+    assert b.xin_luot("arxiv_search", "rotary positional encoding") is None
+    lan_hai = b.xin_luot("arxiv_search", "  Rotary   Positional Encoding ")
+    assert lan_hai is not None and "DA TIM TRUY VAN NAY ROI" in lan_hai
+    assert b.tong_luot == 1, "lời gọi bị từ chối không được tính vào sổ"
+
+
+def test_budget_dung_chung_giua_hai_tool():
+    """Hai tool chung MỘT sổ: tổng số lượt bị chặn, không phải mỗi tool một sổ."""
+    b = SearchBudget(max_calls=2)
+    assert b.xin_luot("arxiv_search", "a") is None
+    assert b.xin_luot("wikipedia_search", "b") is None
+    het = b.xin_luot("arxiv_search", "c")
+    assert het is not None and "HET LUOT TIM KIEM" in het
+
+
+def test_tool_het_luot_thi_khong_goi_mang():
+    """Hết lượt phải trả lời ngay ở tầng tool, không đụng tới arXiv."""
+    tool = make_arxiv_tool(budget=SearchBudget(max_calls=0))
+    out = tool.invoke({"text": "rotary positional encoding"})
+    assert "HET LUOT TIM KIEM" in out
+    assert not out.startswith(ERROR_PREFIX)
+
+
+def test_truy_van_rong_khong_tieu_luot():
+    """Truy vấn rỗng là lỗi của model, không được trừ vào sổ lượt."""
+    b = SearchBudget(max_calls=1)
+    out = make_arxiv_tool(budget=b).invoke({"text": "   "})
+    assert "EMPTY_QUERY" in out
+    assert b.tong_luot == 0
+
+
+# --------------------------------------------------------------------------- #
+# Trích dẫn: kết quả arXiv phải mang mã bài báo thật và ĐÚNG ngày nộp
+# --------------------------------------------------------------------------- #
+from app.agents.research_agent.tools import format_arxiv_docs
+
+
+def _hai_bai():
+    return [
+        {
+            "entry_id": "http://arxiv.org/abs/2104.09864v5",
+            "published": "2021-04-20",
+            "updated": "2023-11-08",
+            "title": "RoFormer: Enhanced Transformer with Rotary Position Embedding",
+            "authors": "Jianlin Su, Yu Lu",
+            "summary": "Tom tat bai mot. " * 40,
+        },
+        {
+            "entry_id": "http://arxiv.org/abs/1706.03762v7",
+            "published": "2017-06-12",
+            "updated": "2023-08-02",
+            "title": "Attention Is All You Need",
+            "authors": "Ashish Vaswani",
+            "summary": "Tom tat bai hai. " * 40,
+        },
+    ]
+
+
+def test_ket_qua_arxiv_co_kem_entry_id():
+    """Không có Entry ID trong kết quả thì model sẽ bịa mã bài báo."""
+    out = format_arxiv_docs(_hai_bai(), max_chars=1000)
+    assert "http://arxiv.org/abs/2104.09864v5" in out
+    assert "http://arxiv.org/abs/1706.03762v7" in out
+
+
+def test_published_la_ngay_nop_khong_phai_ngay_sua():
+    """Bẫy của langchain: wrapper in result.updated dưới nhãn 'Published'.
+
+    Hậu quả: RoFormer nộp 04/2021 bị trích dẫn thành 2023 — sai năm mà nhìn rất thật.
+    """
+    out = format_arxiv_docs(_hai_bai(), max_chars=1000)
+    assert "Published: 2021-04-20" in out
+    assert "Last updated: 2023-11-08" in out
+
+
+def test_cat_bot_theo_tung_bai_khong_nuot_mat_bai_cuoi():
+    """Cắt cả chuỗi sẽ làm bài cuối mất luôn Entry ID + Title — thứ đáng giữ nhất."""
+    out = format_arxiv_docs(_hai_bai(), max_chars=600)
+    assert out.count("Entry ID:") == 2
+    assert "Attention Is All You Need" in out
+
+
+# --------------------------------------------------------------------------- #
+# Sổ lượt tìm kiếm phải tính theo TỪNG CÂU HỎI, không phải theo tiến trình
+# --------------------------------------------------------------------------- #
+class _ToolGia:
+    """Đủ giống một LangChain tool để reset_search_budget() làm việc được."""
+
+    def __init__(self, metadata=None):
+        self.metadata = metadata
+
+
+def test_cau_hoi_moi_duoc_tim_lai_dung_truy_van_do():
+    """Bug thật: sổ tạo một lần lúc dựng agent, không reset giữa các câu hỏi.
+
+    CLI một-câu-một-lần không lộ ra vì tiến trình chết sau mỗi câu. Nhưng vòng
+    lặp hỏi đáp / web dùng lại agent thì câu thứ hai bị chính tool từ chối, dù
+    người dùng đang hỏi một chuyện hoàn toàn mới.
+    """
+    so = SearchBudget(max_calls=2)
+    so.xin_luot("arxiv_search", "rotary embedding")
+    so.xin_luot("arxiv_search", "positional encoding")
+    assert so.xin_luot("arxiv_search", "rotary embedding") is not None  # còn trong sổ cũ
+
+    so.bat_dau_cau_hoi_moi()
+    assert so.xin_luot("arxiv_search", "rotary embedding") is None
+    assert so.tong_luot == 1
+
+
+def test_reset_search_budget_xoa_so_gan_trong_metadata():
+    so = SearchBudget(max_calls=4)
+    so.xin_luot("arxiv_search", "a")
+    tools = [_ToolGia({"search_budget": so}), _ToolGia({"search_budget": so})]
+
+    # Hai tool trỏ chung MỘT sổ -> chỉ tính là một sổ, không xoá hai lần.
+    assert reset_search_budget(tools) == 1
+    assert so.tong_luot == 0 and so.da_goi == set()
+
+
+def test_reset_search_budget_bo_qua_tool_khong_co_so():
+    assert reset_search_budget([]) == 0
+    assert reset_search_budget(None) == 0
+    assert reset_search_budget([_ToolGia(None), _ToolGia({"gi_do_khac": 1})]) == 0
+
+
+def test_ba_tool_mac_dinh_dung_chung_mot_so():
+    """Dùng chung sổ thì TỔNG lượt bị chặn; mỗi tool một sổ là chặn hụt."""
+    tools = default_research_tools()
+    assert len(tools) == 3
+    so = [t.metadata["search_budget"] for t in tools]
+    assert so[0] is so[1] is so[2]
+
+
+# --------------------------------------------------------------------------- #
+# OpenAlex: dựng lại abstract từ inverted index + định dạng kết quả
+# --------------------------------------------------------------------------- #
+from app.agents.research_agent.tools import _dung_lai_abstract, format_openalex_docs
+
+
+def test_dung_lai_abstract_tu_inverted_index():
+    """OpenAlex trả {tu: [vi_tri,...]}, không phải văn bản thẳng -- phải dựng lại đúng thứ tự."""
+    inverted = {"Attention": [0], "is": [1], "all": [2], "you": [3], "need": [4]}
+    assert _dung_lai_abstract(inverted) == "Attention is all you need"
+
+
+def test_dung_lai_abstract_rong_tra_chuoi_rong():
+    assert _dung_lai_abstract(None) == ""
+    assert _dung_lai_abstract({}) == ""
+
+
+def _mot_bai_openalex():
+    return [
+        {
+            "openalex_id": "https://openalex.org/W2741809807",
+            "doi": "https://doi.org/10.7717/peerj.4375",
+            "year": 2018,
+            "title": "The state of OA: a large-scale analysis",
+            "authors": "Heather Piwowar, Jason Priem",
+            "cited_by_count": 1234,
+            "abstract": "Tom tat bai openalex. " * 40,
+        }
+    ]
+
+
+def test_ket_qua_openalex_co_kem_openalex_id():
+    """Không có OpenAlex ID trong kết quả thì grounding.py không xác minh được nguồn."""
+    out = format_openalex_docs(_mot_bai_openalex(), max_chars=1000)
+    assert "https://openalex.org/W2741809807" in out
+    assert "Cited by: 1234" in out
+
+
+# --------------------------------------------------------------------------- #
+# Xác thực nguồn: cờ retracted (OpenAlex) / withdrawn (arXiv) đọc lại từ chính
+# response đã có, không gọi thêm request nào -- xem app/core/authenticity.py
+# --------------------------------------------------------------------------- #
+def test_openalex_khong_bi_rut_thi_khong_co_dong_retracted():
+    out = format_openalex_docs(_mot_bai_openalex(), max_chars=1000)
+    assert "Retracted" not in out
+
+
+def test_openalex_bi_rut_thi_co_dong_retracted():
+    bai = _mot_bai_openalex()
+    bai[0]["is_retracted"] = True
+    out = format_openalex_docs(bai, max_chars=1000)
+    assert "Retracted: CÓ" in out
+
+
+def test_arxiv_khong_bi_rut_thi_khong_co_dong_withdrawn():
+    out = format_arxiv_docs(_hai_bai(), max_chars=1000)
+    assert "Withdrawn" not in out
+
+
+def test_arxiv_bi_rut_thi_co_dong_withdrawn():
+    bai = _hai_bai()
+    bai[0]["withdrawn"] = True
+    out = format_arxiv_docs(bai, max_chars=1000)
+    assert "Withdrawn: CÓ" in out
+
+
+class _KetQuaArxivGia:
+    """Giả một `arxiv.Result` -- đủ thuộc tính tim_arxiv() đọc tới, không gọi mạng."""
+
+    def __init__(self, entry_id: str, comment: str = "", summary: str = "Tom tat binh thuong"):
+        self.entry_id = entry_id
+        self.published = datetime.datetime(2020, 1, 1)
+        self.updated = datetime.datetime(2020, 2, 1)
+        self.title = "Bai bao gia"
+        self.authors: list = []
+        self.summary = summary
+        self.comment = comment
+
+
+class _TimKiemArxivGia:
+    def __init__(self, ket_qua):
+        self._ket_qua = ket_qua
+
+    def results(self):
+        return self._ket_qua
+
+
+class _WrapperArxivGia:
+    ARXIV_MAX_QUERY_LENGTH = 200
+    top_k_results = 1
+
+    def __init__(self, ket_qua):
+        self._ket_qua = ket_qua
+
+    def is_arxiv_identifier(self, query):
+        return False
+
+    def arxiv_search(self, query, max_results):
+        return _TimKiemArxivGia(self._ket_qua)
+
+
+def test_tim_arxiv_nhan_dien_bai_bi_rut_qua_comment():
+    r = _KetQuaArxivGia(
+        "http://arxiv.org/abs/9999.99999v1",
+        comment="This paper has been withdrawn by the author(s)",
+    )
+    wrapper = _WrapperArxivGia([r])
+    items = tim_arxiv(wrapper, "query")
+    assert items[0]["withdrawn"] is True
+
+
+def test_tim_arxiv_bai_binh_thuong_khong_bi_gan_co():
+    r = _KetQuaArxivGia("http://arxiv.org/abs/1111.11111v1")
+    wrapper = _WrapperArxivGia([r])
+    items = tim_arxiv(wrapper, "query")
+    assert items[0]["withdrawn"] is False

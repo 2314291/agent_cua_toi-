@@ -32,9 +32,10 @@ def goi(tool, text):
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
-def test_registry_co_dung_hai_chu_de():
+def test_registry_co_dung_muoi_chu_de():
     assert [s.name for s in TOPIC_SPECS] == [
         "scholar_agent", "explainer_agent", "news_agent", "code_agent", "travel_agent", "culture_agent",
+        "weather_agent", "economy_agent", "geo_agent", "dictionary_agent",
     ]
 
 

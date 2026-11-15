@@ -13,10 +13,14 @@ from app.agents.research_agent.profiles import SearchProfile
 from app.agents.research_agent.tools import SearchBudget
 from app.agents.research_agent.topics import code_agent as code
 from app.agents.research_agent.topics import culture_agent as culture
+from app.agents.research_agent.topics import dictionary_agent as dictionary
+from app.agents.research_agent.topics import economy_agent as economy
 from app.agents.research_agent.topics import explainer_agent as explainer
+from app.agents.research_agent.topics import geo_agent as geo
 from app.agents.research_agent.topics import news_agent as news
 from app.agents.research_agent.topics import scholar_agent as scholar
 from app.agents.research_agent.topics import travel_agent as travel
+from app.agents.research_agent.topics import weather_agent as weather
 from app.agents.research_agent.topics.topic_tool import make_topic_tool
 
 
@@ -39,6 +43,11 @@ TOPIC_SPECS: Tuple[TopicSpec, ...] = (
     TopicSpec(travel.TOPIC_NAME, travel.TOPIC_DESCRIPTION, travel.build_travel_agent, travel.default_travel_tools),
     TopicSpec(culture.TOPIC_NAME, culture.TOPIC_DESCRIPTION, culture.build_culture_agent,
               culture.default_culture_tools, postprocess=culture.gioi_han_trich_dan),
+    TopicSpec(weather.TOPIC_NAME, weather.TOPIC_DESCRIPTION, weather.build_weather_agent, weather.default_weather_tools),
+    TopicSpec(economy.TOPIC_NAME, economy.TOPIC_DESCRIPTION, economy.build_economy_agent, economy.default_economy_tools),
+    TopicSpec(geo.TOPIC_NAME, geo.TOPIC_DESCRIPTION, geo.build_geo_agent, geo.default_geo_tools),
+    TopicSpec(dictionary.TOPIC_NAME, dictionary.TOPIC_DESCRIPTION, dictionary.build_dictionary_agent,
+              dictionary.default_dictionary_tools),
 )
 
 

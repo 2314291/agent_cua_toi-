@@ -179,6 +179,7 @@ def test_research_arch_topics_dung_lead(monkeypatch):
     assert agent.name == "research_agent"
     assert _ten_tool(agent) == {
         "scholar_agent", "explainer_agent", "news_agent", "code_agent", "travel_agent", "culture_agent",
+        "weather_agent", "economy_agent", "geo_agent", "dictionary_agent",
     }
     assert "post_model_hook" in agent.nodes
 

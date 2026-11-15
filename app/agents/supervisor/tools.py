@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
 import re
+import time
 from typing import Any, Optional, Tuple
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from app.agents.research_agent.agent import build_research_agent
+from app.agents.supervisor.budget import budget_from_config
 from app.agents.vision_agent.agent import build_vision_agent
 from app.agents.vision_agent.image_utils import extract_image_ref
 from app.agents.vision_agent.tools import can_dem_vat_the, tra_loi_truc_tiep
@@ -70,8 +73,88 @@ def reset_sub_agent_instances():
     _research_agent_theo_che_do.clear()
 
 
-def _chay_agent_con(agent, query: str, config: Optional[dict] = None):
+# Lỗi TẠM THỜI (mạng chập chờn, nhà cung cấp quá tải): thử lại đúng MỘT lần. So theo TÊN lớp
+# để không phải import SDK của từng nhà cung cấp (google, openai, groq, httpx...).
+_TRANSIENT_ERROR_NAMES = frozenset({
+    "TimeoutError", "ConnectionError", "ConnectionResetError", "ConnectTimeout", "ReadTimeout",
+    "APITimeoutError", "APIConnectionError", "RateLimitError", "ResourceExhausted",
+    "ServiceUnavailable", "InternalServerError", "DeadlineExceeded",
+})
+_RETRY_BACKOFF_SECONDS = 0.1
+
+# Khoá nội bộ của LangGraph trong configurable (scratchpad, checkpoint của graph CHA). Đưa
+# chúng xuống graph con sẽ làm graph con tưởng mình là một node của graph cha -> bỏ đi.
+_KHOA_NOI_BO_PREFIX = ("__pregel_", "checkpoint_")
+_KHOA_CAU_HINH_TRUYEN = ("recursion_limit", "callbacks", "tags", "metadata", "max_concurrency")
+
+
+def _la_loi_tam_thoi(exc: BaseException) -> bool:
+    return any(lop.__name__ in _TRANSIENT_ERROR_NAMES for lop in type(exc).__mro__)
+
+
+def _config_cho_agent_con(config: Optional[dict]) -> Optional[dict]:
+    """Config của lượt supervisor -> config cho graph con.
+
+    Giữ recursion_limit, callbacks, metadata và configurable của NGƯỜI DÙNG (ngân sách,
+    tool_sink, image_resolver, research_mode...), bỏ khoá nội bộ của LangGraph.
+    """
+    if not config:
+        return None
+    con = {k: config[k] for k in _KHOA_CAU_HINH_TRUYEN if config.get(k) is not None}
+    configurable = config.get("configurable")
+    if isinstance(configurable, dict):
+        con["configurable"] = {
+            k: v for k, v in configurable.items() if not str(k).startswith(_KHOA_NOI_BO_PREFIX)
+        }
+    return con
+
+
+def _nhan_config(agent) -> bool:
+    """Agent có nhận tham số config không (graph thật: có; agent giả kiểu cũ: có thể không)."""
+    try:
+        tham_so = inspect.signature(agent.invoke).parameters
+    except (TypeError, ValueError):
+        return True
+    return "config" in tham_so or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in tham_so.values()
+    )
+
+
+def _invoke_agent(agent, state: dict, config: Optional[dict]):
+    if config is not None and _nhan_config(agent):
+        return agent.invoke(state, config=config)
+    return agent.invoke(state)
+
+
+def _loi_agent(code: str, agent_name: str, message: str) -> str:
+    return tool_error(code, f"agent={agent_name}: {message}")
+
+
+def _giu_ngan_sach(agent_name: str, config: Optional[dict]) -> Optional[str]:
+    """Xin một lượt gọi agent con từ CallBudget của lượt này. None = được phép."""
+    allowed, reason, agent_calls, total_calls = budget_from_config(config).reserve(agent_name)
+    if allowed:
+        return None
+    if reason == "agent":
+        return _loi_agent(
+            "CALL_BUDGET_AGENT_LIMIT", agent_name,
+            f"already called {agent_calls} times this turn. Do NOT call it again; "
+            "answer from the information you already have.",
+        )
+    return _loi_agent(
+        "CALL_BUDGET_TOTAL_LIMIT", agent_name,
+        f"the turn already used {total_calls} sub-agent calls. Do NOT call any agent "
+        "again; answer from the information you already have.",
+    )
+
+
+def _chay_agent_con(agent, query: str, config: Optional[dict] = None, agent_name: Optional[str] = None):
     """Chạy agent con, trả (câu trả lời cuối, artifact cho web UI).
+
+    Đây là nơi DUY NHẤT supervisor chạm vào agent con, nên mọi lớp bảo vệ nằm ở đây:
+    kiểm tra agent hợp lệ -> xin ngân sách (CallBudget) -> gọi kèm config của lượt cha
+    (thử lại 1 lần nếu lỗi tạm thời) -> kiểm tra state trả về -> gom artifact. Lỗi KHÔNG
+    raise mà trả chuỗi "ERROR: ..." có cấu trúc (IF-05) để supervisor tự xử lý.
 
     artifact KHÔNG gửi cho LLM của supervisor (response_format="content_and_artifact"),
     chỉ nằm trong ToolMessage.artifact để app/api.py đọc: kết quả tool bên trong
@@ -82,11 +165,32 @@ def _chay_agent_con(agent, query: str, config: Optional[dict] = None):
 
     from app.core.pretty import message_text
 
-    result = agent.invoke({"messages": [("user", query)]})
+    ten = agent_name or getattr(agent, "name", None) or "sub_agent"
+    if not callable(getattr(agent, "invoke", None)):
+        return _loi_agent("SUB_AGENT_INVALID", ten, "object has no invoke() method."), {}
+
+    het_luot = _giu_ngan_sach(ten, config)
+    if het_luot:
+        return het_luot, {}
+
+    config_con = _config_cho_agent_con(config)
+    result = None
+    for lan in range(2):
+        try:
+            result = _invoke_agent(agent, {"messages": [("user", query)]}, config_con)
+            break
+        except Exception as exc:  # noqa: BLE001 - đổi mọi lỗi agent con thành chuỗi lỗi
+            if lan == 0 and _la_loi_tam_thoi(exc):
+                time.sleep(_RETRY_BACKOFF_SECONDS)
+                continue
+            return _loi_agent("SUB_AGENT_ERROR", ten, f"{type(exc).__name__}: {exc}"[:500]), {}
+
     chuyen_ket_qua_tool_con(result, config)
-    messages = result.get("messages", []) if isinstance(result, dict) else []
+    messages = result.get("messages") if isinstance(result, dict) else None
     if not messages:
-        return str(result), {}
+        return _loi_agent(
+            "SUB_AGENT_EMPTY_STATE", ten, "the agent returned no messages."
+        ), {}
     tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
     topics, bang_chung = [], []
     for m in tool_msgs:
@@ -374,7 +478,7 @@ def research_tool(query: str, config: RunnableConfig = None):
     Input should be a clear, self-contained question.
     """
     mode = ((config or {}).get("configurable") or {}).get("research_mode")
-    return _chay_agent_con(get_research_agent(mode), query)
+    return _chay_agent_con(get_research_agent(mode), query, config, agent_name="research_agent")
 
 
 @tool("vision_agent_tool", response_format="content_and_artifact")
@@ -424,7 +528,7 @@ def vision_tool(
         nhanh = thu_tra_loi_truc_tiep(query, image_path)
         if nhanh is not None:
             return nhanh, {}
-        return _chay_agent_con(get_vision_agent(), full_query, config)
+        return _chay_agent_con(get_vision_agent(), full_query, config, agent_name="vision_agent")
 
 
 def make_sub_agent_tool(agent: Any) -> BaseTool:
@@ -439,14 +543,9 @@ def make_sub_agent_tool(agent: Any) -> BaseTool:
     tool_name = f"{agent_name}_tool" if not agent_name.endswith("_tool") else agent_name
 
     @tool(tool_name)
-    def dynamic_sub_agent_tool(query: str) -> str:
+    def dynamic_sub_agent_tool(query: str, config: RunnableConfig = None) -> str:
         """Forward query to the sub-agent and return the final response text."""
-        if hasattr(agent, "invoke"):
-            res = agent.invoke({"messages": [("user", query)]})
-            if isinstance(res, dict) and "messages" in res:
-                return res["messages"][-1].content
-            return str(res)
-        return f"Agent {agent_name} executed."
+        return _chay_agent_con(agent, query, config, agent_name=agent_name)[0]
 
     return dynamic_sub_agent_tool
 

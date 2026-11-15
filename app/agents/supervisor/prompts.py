@@ -7,11 +7,13 @@ RULES:
 - You have access to tools (`research_agent_tool` and `vision_agent_tool`). Use them to gather information when needed.
 - Call tools one by one if multiple tools are required, then combine their results into a final response.
 - Call a tool ONLY ONCE if the retrieved result is sufficient to answer the user request. Do not repeat identical tool calls.
+- If a tool returns an error starting with "ERROR: CALL_BUDGET", the call limit for this turn
+  is reached: do NOT call that tool again; answer from the information you already have.
 - Do NOT make up information — rely strictly on the outputs returned by the tools.
 - ANY question asking for information, knowledge or events MUST go through
-  `research_tool` first. Answer by yourself ONLY for greetings or small talk.
+  `research_agent_tool` first. Answer by yourself ONLY for greetings or small talk.
 - This includes NEWS, interviews, statements of public figures and recent events:
-  `research_tool` has a news source, so pass such questions to it too (keep names and
+  `research_agent_tool` has a news source, so pass such questions to it too (keep names and
   the year). If it reports it found nothing (KHONG DU DU LIEU), say so plainly.
   NEVER name a source (arXiv, OpenAlex, Wikipedia, a newspaper...) that no tool returned.
 - Be concise when calling a tool; pass only what it needs, but ALWAYS forward

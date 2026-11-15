@@ -1072,16 +1072,30 @@ def ask_research(
 def deep_research(
     question: str = Form(..., description="Cau hoi can tim hieu sau, vd 'rotary positional encoding'"),
     research_mode: str = Form("", description="eco | standard | full - de trong = theo RESEARCH_MODE cua server"),
+    user_id: str = Form("", description="Id ngau nhien trinh duyet tu sinh, de tach lich su"),
+    conversation_id: str = Form("", description="De trong = mo hoi thoai moi"),
+    project_id: str = Form("", description="Chi dung khi mo hoi thoai moi: tao luon trong project nay"),
+    request_id: str = Form("", description="Ma luot do trinh duyet tao; bam Dung -> /api/ask/cancel"),
+    authorization: Optional[str] = Header(None),
 ):
     """Tim kiem chuyen sau: quy trinh co dinh plan -> research (goi agent chu de) -> refine
     -> write (xem app/agents/research_agent/deep_research.py), ghi bao cao .md vao
     runs/research/ va tra noi dung ve cho UI. Ton 1 + (2-4 x so cau hoi con) + 0-1 + 1
-    luot LLM (moi agent chu de tu goi LLM cua no). Khong luu lich su."""
+    luot LLM (moi agent chu de tu goi LLM cua no).
+
+    Luu lich su GIONG /api/ask: co danh tinh -> luu cau hoi + bao cao vao hoi thoai
+    (tao moi neu chua co, chi tao khi da co bao cao). Khach vang lai -> khong luu.
+    Cau hoi chuyen sau khong doc lich su lam ngu canh: moi bao cao dung mot minh."""
     che_do = research_mode.strip().lower()
     if che_do and che_do not in RESEARCH_MODES:
         raise HTTPException(status_code=400, detail=f"research_mode phai la mot trong {list(RESEARCH_MODES)}")
     if not question.strip():
         raise HTTPException(status_code=400, detail="Cau hoi khong duoc de trong.")
+    uid = _danh_tinh_tuy_chon(authorization, user_id)
+    hoi_thoai: Optional[dict] = None
+    if uid and conversation_id:
+        # Kiem tra quyen TRUOC khi ton 1-2 phut chay bao cao.
+        hoi_thoai = _bat_buoc_co_hoi_thoai(conversation_id, uid)
     from app.agents.research_agent.deep_research import run_deep_research
 
     try:
@@ -1096,6 +1110,7 @@ def deep_research(
         "sub_questions": kq["sub_questions"],
         "research_mode": kq["mode"],
         "grounding": kq["grounding"],
+        "deep": True,
     }
     # Giong che do thuong: agent chu de nao da chay + ma tin gn-... -> link bai bao.
     if kq.get("trace"):
@@ -1107,6 +1122,24 @@ def deep_research(
     }
     if links:
         response["link_map"] = links
+
+    ma_luot = (request_id or "").strip()[:80]
+    if ma_luot and ma_luot in _LUOT_DA_HUY:
+        _LUOT_DA_HUY.pop(ma_luot, None)  # nguoi dung da bam Dung: khong luu gi
+        return {"cancelled": True, "answer": ""}
+
+    if uid:
+        if hoi_thoai is None:
+            hoi_thoai = store.tao_hoi_thoai(uid, store.dat_tieu_de(question))
+            if project_id and store.lay_project(project_id, uid) is not None:
+                store.gan_project(hoi_thoai["id"], project_id)
+        cid = hoi_thoai["id"]
+        store.them_tin_nhan(cid, "user", question, {"deep": True})
+        # extras giu ca markdown (vai KB) de mo lai hoi thoai van tai duoc bao cao .md.
+        store.them_tin_nhan(cid, "assistant", response["answer"],
+                            {k: v for k, v in response.items() if k != "answer"})
+        response["conversation_id"] = cid
+        response["title"] = hoi_thoai["title"]
     return response
 
 

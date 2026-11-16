@@ -25,6 +25,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import socket
+from urllib.parse import urlsplit
+
 from sqlalchemy import (
     Boolean,
     Column,
@@ -186,6 +189,27 @@ def _chuan_hoa_url(raw: str) -> str:
     return raw
 
 
+def _ipv4_cua_host(url: str) -> str:
+    """Tìm địa chỉ IPv4 của host Postgres, hoặc "" nếu không có.
+
+    Render (gói Free) không có đường ra IPv6. Neon/Supabase trả về cả bản ghi
+    AAAA nên driver có thể thử IPv6 trước và chết với `Network is unreachable`
+    dù host vẫn có IPv4. Ép kết nối qua IPv4 bằng `hostaddr` của libpq: vẫn giữ
+    nguyên `host` trong chuỗi kết nối nên TLS/SNI của Neon chạy đúng như cũ.
+    """
+    try:
+        phan = urlsplit(url)
+        host = phan.hostname
+        if not host:
+            return ""
+        cong = phan.port or 5432
+        ket_qua = socket.getaddrinfo(host, cong, socket.AF_INET, socket.SOCK_STREAM)
+        return ket_qua[0][4][0] if ket_qua else ""
+    except (OSError, ValueError):
+        # Không có bản ghi IPv4 hay DNS lỗi: để driver tự xử lý như trước.
+        return ""
+
+
 def get_engine() -> Engine:
     """Engine dùng chung cho cả tiến trình. Tạo một lần, tự tạo bảng nếu chưa có."""
     global _engine
@@ -194,8 +218,11 @@ def get_engine() -> Engine:
 
     raw = settings.database_url
     if raw:
+        url = _chuan_hoa_url(raw)
+        ipv4 = _ipv4_cua_host(url)
         _engine = create_engine(
-            _chuan_hoa_url(raw),
+            url,
+            connect_args={"hostaddr": ipv4} if ipv4 else {},
             # Neon tự ngắt kết nối nhàn rỗi. Không có pre_ping thì request đầu
             # tiên sau lúc rảnh sẽ chết với "server closed the connection".
             pool_pre_ping=True,
